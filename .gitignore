@@ -1,0 +1,6 @@
+build/
+dist/
+*.wcp
+*.so
+__pycache__/
+.DS_Store
