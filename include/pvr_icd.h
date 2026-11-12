@@ -59,6 +59,27 @@ struct pvr_hwvulkan_device_t {
 #define VK_MEMORY_MAP_PLACED_BIT_EXT ((VkMemoryMapFlags)0x00000001)
 #endif
 
+#ifndef VK_MEMORY_UNMAP_RESERVE_BIT_EXT
+#define VK_MEMORY_UNMAP_RESERVE_BIT_EXT ((VkMemoryUnmapFlagsKHR)0x00000001)
+#endif
+
+#ifndef VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
+#define VK_EXT_MEMORY_BUDGET_EXTENSION_NAME "VK_EXT_memory_budget"
+#define VK_EXT_MEMORY_BUDGET_SPEC_VERSION 1
+#endif
+
+#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT ((VkStructureType)1000237000)
+typedef struct PvrVkPhysicalDeviceMemoryBudgetPropertiesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkDeviceSize heapBudget[VK_MAX_MEMORY_HEAPS];
+    VkDeviceSize heapUsage[VK_MAX_MEMORY_HEAPS];
+} PvrVkPhysicalDeviceMemoryBudgetPropertiesEXT;
+#else
+typedef VkPhysicalDeviceMemoryBudgetPropertiesEXT PvrVkPhysicalDeviceMemoryBudgetPropertiesEXT;
+#endif
+
 #ifndef VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR
 #define VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR ((VkStructureType)1000271000)
 #define VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR ((VkStructureType)1000271001)

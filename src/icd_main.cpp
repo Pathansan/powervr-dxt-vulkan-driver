@@ -1,10 +1,12 @@
 #include "pvr_icd.h"
+#include "pnext_utils.h"
 #include "log.h"
 #include "x18_guard.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -14,6 +16,27 @@
 #include <string>
 
 namespace {
+
+static bool env_flag_enabled(const char* name) {
+    const char* val = getenv(name);
+    return val && val[0] == '1';
+}
+
+static uint64_t read_meminfo_available_bytes() {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t avail_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            avail_kb = kb;
+            break;
+        }
+    }
+    fclose(f);
+    return avail_kb * 1024ULL;
+}
 
 struct BackendLoader {
     void* handle = nullptr;
@@ -31,7 +54,6 @@ struct BackendLoader {
         initialized = true;
         pvr_log_init();
 
-        // 1. Try loading the PowerVR HAL directly
         handle = dlopen("/vendor/lib64/hw/vulkan.powervr.so", RTLD_NOW | RTLD_LOCAL);
         if (handle) {
             auto* hmi = reinterpret_cast<pvr_hw_module_t*>(dlsym(handle, "HMI"));
@@ -56,7 +78,6 @@ struct BackendLoader {
             pvr_log("dlopen(/vendor/lib64/hw/vulkan.powervr.so) failed: %s", dlerror());
         }
 
-        // 2. Fallback to Android system Vulkan loader
         handle = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
         if (!handle) {
             handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -82,13 +103,15 @@ struct InstanceDispatch {
     PFN_vkDestroyInstance DestroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures GetPhysicalDeviceFeatures = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2 = nullptr;
     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2 = nullptr;
-    PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2 = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 GetPhysicalDeviceMemoryProperties2 = nullptr;
     PFN_vkCreateDevice CreateDevice = nullptr;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
+    PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
 };
 
 struct DeviceDispatch {
@@ -96,19 +119,30 @@ struct DeviceDispatch {
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
     InstanceDispatch* inst = nullptr;
     PFN_vkDestroyDevice DestroyDevice = nullptr;
+    PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
+    PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
+    PFN_vkQueueSubmit QueueSubmit = nullptr;
+    PFN_vkQueueSubmit2 QueueSubmit2 = nullptr;
     PFN_vkAllocateMemory AllocateMemory = nullptr;
     PFN_vkFreeMemory FreeMemory = nullptr;
     PFN_vkMapMemory MapMemory = nullptr;
     PFN_vkUnmapMemory UnmapMemory = nullptr;
+    PFN_vkBindBufferMemory BindBufferMemory = nullptr;
+    PFN_vkBindImageMemory BindImageMemory = nullptr;
+    PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines = nullptr;
+    PFN_vkCreateComputePipelines CreateComputePipelines = nullptr;
     PFN_vkGetMemoryFdKHR GetMemoryFdKHR = nullptr;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     bool has_external_fd = false;
+    bool has_dma_buf = false;
     uint32_t host_visible_type_mask = 0;
+    uint32_t type_to_heap[VK_MAX_MEMORY_TYPES]{};
 };
 
 struct MemoryRecord {
     VkDeviceSize size = 0;
     uint32_t memory_type_index = 0;
+    uint32_t heap_index = 0;
     int exported_fd = -1;
     void* placed_addr = nullptr;
     VkDeviceSize mapped_size = 0;
@@ -119,7 +153,9 @@ std::mutex g_state_mutex;
 std::unordered_map<VkInstance, InstanceDispatch*> g_instances;
 std::unordered_map<VkPhysicalDevice, InstanceDispatch*> g_phys_to_inst;
 std::unordered_map<VkDevice, DeviceDispatch*> g_devices;
+std::unordered_map<VkQueue, DeviceDispatch*> g_queue_to_dev;
 std::unordered_map<VkDeviceMemory, MemoryRecord> g_memories;
+VkDeviceSize g_heap_usage[VK_MAX_MEMORY_HEAPS]{};
 
 InstanceDispatch* get_instance_dispatch(VkInstance instance) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
@@ -141,95 +177,26 @@ DeviceDispatch* get_device_dispatch(VkDevice device) {
     return (it != g_devices.end()) ? it->second : nullptr;
 }
 
-// Helper to rebuild a pNext chain filtering out specific sTypes
-struct GenericStruct {
-    VkStructureType sType;
-    const void* pNext;
-};
+DeviceDispatch* get_queue_device(VkQueue queue) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    auto it = g_queue_to_dev.find(queue);
+    if (it != g_queue_to_dev.end()) return it->second;
+    if (!g_devices.empty()) return g_devices.begin()->second;
+    return nullptr;
+}
 
 static bool is_filtered_alloc_stype(VkStructureType sType) {
-    // 1000178000 = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT
-    // 1000272002 = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT
     return sType == (VkStructureType)1000178000 ||
            sType == VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT;
 }
 
-// Forward declarations of hooked Vulkan functions
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateInstance(
-    const VkInstanceCreateInfo* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkInstance* pInstance);
+static bool is_filtered_device_stype(VkStructureType sType) {
+    return sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT;
+}
 
-VKAPI_ATTR void VKAPI_CALL pvr_vkDestroyInstance(
-    VkInstance instance,
-    const VkAllocationCallbacks* pAllocator);
-
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumeratePhysicalDevices(
-    VkInstance instance,
-    uint32_t* pPhysicalDeviceCount,
-    VkPhysicalDevice* pPhysicalDevices);
-
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumerateDeviceExtensionProperties(
-    VkPhysicalDevice physicalDevice,
-    const char* pLayerName,
-    uint32_t* pPropertyCount,
-    VkExtensionProperties* pProperties);
-
-VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
-    VkPhysicalDevice physicalDevice,
-    VkPhysicalDeviceFeatures2* pFeatures);
-
-VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceProperties2(
-    VkPhysicalDevice physicalDevice,
-    VkPhysicalDeviceProperties2* pProperties);
-
-VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceMemoryProperties(
-    VkPhysicalDevice physicalDevice,
-    VkPhysicalDeviceMemoryProperties* pMemoryProperties);
-
-VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceMemoryProperties2(
-    VkPhysicalDevice physicalDevice,
-    VkPhysicalDeviceMemoryProperties2* pMemoryProperties);
-
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
-    VkPhysicalDevice physicalDevice,
-    const VkDeviceCreateInfo* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkDevice* pDevice);
-
-VKAPI_ATTR void VKAPI_CALL pvr_vkDestroyDevice(
-    VkDevice device,
-    const VkAllocationCallbacks* pAllocator);
-
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkAllocateMemory(
-    VkDevice device,
-    const VkMemoryAllocateInfo* pAllocateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkDeviceMemory* pMemory);
-
-VKAPI_ATTR void VKAPI_CALL pvr_vkFreeMemory(
-    VkDevice device,
-    VkDeviceMemory memory,
-    const VkAllocationCallbacks* pAllocator);
-
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkMapMemory2KHR(
-    VkDevice device,
-    const PvrVkMemoryMapInfoKHR* pMemoryMapInfo,
-    void** ppData);
-
-VKAPI_ATTR VkResult VKAPI_CALL pvr_vkUnmapMemory2KHR(
-    VkDevice device,
-    const PvrVkMemoryUnmapInfoKHR* pMemoryUnmapInfo);
-
-VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetDeviceProcAddr(
-    VkDevice device,
-    const char* pName);
-
-VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(
-    VkInstance instance,
-    const char* pName);
-
-// Implementations
+// Forward declarations
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetDeviceProcAddr(VkDevice device, const char* pName);
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(VkInstance instance, const char* pName);
 
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateInstance(
     const VkInstanceCreateInfo* pCreateInfo,
@@ -258,14 +225,15 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateInstance(
     disp->DestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(resolve("vkDestroyInstance"));
     disp->EnumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(resolve("vkEnumeratePhysicalDevices"));
     disp->EnumerateDeviceExtensionProperties = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(resolve("vkEnumerateDeviceExtensionProperties"));
+    disp->GetPhysicalDeviceFeatures = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(resolve("vkGetPhysicalDeviceFeatures"));
+    disp->GetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(resolve("vkGetPhysicalDeviceFeatures2"));
+    if (!disp->GetPhysicalDeviceFeatures2) {
+        disp->GetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(resolve("vkGetPhysicalDeviceFeatures2KHR"));
+    }
     disp->GetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(resolve("vkGetPhysicalDeviceProperties"));
     disp->GetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(resolve("vkGetPhysicalDeviceProperties2"));
     if (!disp->GetPhysicalDeviceProperties2) {
         disp->GetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(resolve("vkGetPhysicalDeviceProperties2KHR"));
-    }
-    disp->GetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(resolve("vkGetPhysicalDeviceFeatures2"));
-    if (!disp->GetPhysicalDeviceFeatures2) {
-        disp->GetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(resolve("vkGetPhysicalDeviceFeatures2KHR"));
     }
     disp->GetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(resolve("vkGetPhysicalDeviceMemoryProperties"));
     disp->GetPhysicalDeviceMemoryProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(resolve("vkGetPhysicalDeviceMemoryProperties2"));
@@ -274,6 +242,7 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateInstance(
     }
     disp->CreateDevice = reinterpret_cast<PFN_vkCreateDevice>(resolve("vkCreateDevice"));
     disp->GetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(resolve("vkGetDeviceProcAddr"));
+    disp->QueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(resolve("vkQueuePresentKHR"));
 
     std::lock_guard<std::mutex> lock(g_state_mutex);
     g_instances[*pInstance] = disp;
@@ -337,18 +306,18 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumerateDeviceExtensionProperties(
         if (res != VK_SUCCESS && res != VK_INCOMPLETE) return res;
     }
 
-    bool has_placed = false;
-    for (const auto& e : exts) {
-        if (strcmp(e.extensionName, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) == 0) {
-            has_placed = true;
-            break;
-        }
-    }
-    if (!has_placed && !pLayerName) {
-        VkExtensionProperties placed{};
-        strncpy(placed.extensionName, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME, VK_MAX_EXTENSION_NAME_SIZE - 1);
-        placed.specVersion = VK_EXT_MAP_MEMORY_PLACED_SPEC_VERSION;
-        exts.push_back(placed);
+    if (!pLayerName) {
+        auto add_if_missing = [&](const char* name, uint32_t spec_ver) {
+            for (const auto& e : exts) {
+                if (strcmp(e.extensionName, name) == 0) return;
+            }
+            VkExtensionProperties ext{};
+            strncpy(ext.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE - 1);
+            ext.specVersion = spec_ver;
+            exts.push_back(ext);
+        };
+        add_if_missing(VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_SPEC_VERSION);
+        add_if_missing(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VK_EXT_MEMORY_BUDGET_SPEC_VERSION);
     }
 
     if (!pProperties) {
@@ -363,6 +332,28 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumerateDeviceExtensionProperties(
     return incomplete ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+static void apply_feature_overrides(VkPhysicalDeviceFeatures* f) {
+    if (!f) return;
+    if (env_flag_enabled("PVR_ICD_SPOOF_BC")) {
+        f->textureCompressionBC = VK_TRUE;
+    }
+    if (env_flag_enabled("PVR_ICD_SPOOF_PIPELINE_STATS")) {
+        f->pipelineStatisticsQuery = VK_TRUE;
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures(
+    VkPhysicalDevice physicalDevice,
+    VkPhysicalDeviceFeatures* pFeatures) {
+    InstanceDispatch* disp = get_phys_instance(physicalDevice);
+    if (!disp || !disp->GetPhysicalDeviceFeatures) return;
+    {
+        PvrX18Guard guard;
+        disp->GetPhysicalDeviceFeatures(physicalDevice, pFeatures);
+    }
+    apply_feature_overrides(pFeatures);
+}
+
 VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice,
     VkPhysicalDeviceFeatures2* pFeatures) {
@@ -373,18 +364,20 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
         PvrX18Guard guard;
         disp->GetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
     }
+    if (pFeatures) {
+        apply_feature_overrides(&pFeatures->features);
+    }
 
-    // Populate VK_EXT_map_memory_placed features if queried
     void* next = pFeatures ? pFeatures->pNext : nullptr;
     while (next) {
-        auto* header = reinterpret_cast<GenericStruct*>(next);
+        auto* header = reinterpret_cast<PvrGenericOutStruct*>(next);
         if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) {
             auto* placed = reinterpret_cast<PvrVkPhysicalDeviceMapMemoryPlacedFeaturesEXT*>(next);
             placed->memoryMapPlaced = VK_TRUE;
             placed->memoryMapRangePlaced = VK_TRUE;
             placed->memoryUnmapReserve = VK_TRUE;
         }
-        next = const_cast<void*>(header->pNext);
+        next = header->pNext;
     }
 }
 
@@ -401,12 +394,12 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceProperties2(
 
     void* next = pProperties ? pProperties->pNext : nullptr;
     while (next) {
-        auto* header = reinterpret_cast<GenericStruct*>(next);
+        auto* header = reinterpret_cast<PvrGenericOutStruct*>(next);
         if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT) {
             auto* placed = reinterpret_cast<PvrVkPhysicalDeviceMapMemoryPlacedPropertiesEXT*>(next);
             placed->minPlacedMemoryMapAlignment = 4096;
         }
-        next = const_cast<void*>(header->pNext);
+        next = header->pNext;
     }
 }
 
@@ -424,8 +417,37 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceMemoryProperties2(
     VkPhysicalDeviceMemoryProperties2* pMemoryProperties) {
     InstanceDispatch* disp = get_phys_instance(physicalDevice);
     if (!disp || !disp->GetPhysicalDeviceMemoryProperties2) return;
-    PvrX18Guard guard;
-    disp->GetPhysicalDeviceMemoryProperties2(physicalDevice, pMemoryProperties);
+
+    {
+        PvrX18Guard guard;
+        disp->GetPhysicalDeviceMemoryProperties2(physicalDevice, pMemoryProperties);
+    }
+
+    void* next = pMemoryProperties ? pMemoryProperties->pNext : nullptr;
+    while (next) {
+        auto* header = reinterpret_cast<PvrGenericOutStruct*>(next);
+        if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT &&
+            pMemoryProperties) {
+            auto* budget = reinterpret_cast<PvrVkPhysicalDeviceMemoryBudgetPropertiesEXT*>(next);
+            uint64_t avail_sys = read_meminfo_available_bytes();
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; ++i) {
+                if (i < pMemoryProperties->memoryProperties.memoryHeapCount) {
+                    VkDeviceSize heap_sz = pMemoryProperties->memoryProperties.memoryHeaps[i].size;
+                    VkDeviceSize used = g_heap_usage[i];
+                    VkDeviceSize b = (i == 0 && avail_sys > 0 && avail_sys < heap_sz)
+                                         ? static_cast<VkDeviceSize>(avail_sys)
+                                         : heap_sz;
+                    budget->heapBudget[i] = b;
+                    budget->heapUsage[i] = used;
+                } else {
+                    budget->heapBudget[i] = 0;
+                    budget->heapUsage[i] = 0;
+                }
+            }
+        }
+        next = header->pNext;
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
@@ -436,37 +458,29 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
     InstanceDispatch* disp = get_phys_instance(physicalDevice);
     if (!disp || !disp->CreateDevice) return VK_ERROR_INITIALIZATION_FAILED;
 
-    // Filter out emulated VK_EXT_map_memory_placed from enabled extensions & pNext
     VkDeviceCreateInfo local_ci = *pCreateInfo;
     std::vector<const char*> filtered_exts;
-    bool has_ext_mem_fd = false;
+    bool has_ext_fd = false;
+    bool has_dma_buf = false;
+
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
-        if (strcmp(ext, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) == 0) {
+        if (strcmp(ext, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) == 0 ||
+            strcmp(ext, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
             continue;
         }
-        if (strcmp(ext, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) {
-            has_ext_mem_fd = true;
-        }
+        if (strcmp(ext, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) has_ext_fd = true;
+        if (strcmp(ext, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) has_dma_buf = true;
         filtered_exts.push_back(ext);
     }
-    if (!has_ext_mem_fd) {
-        filtered_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
-    }
+    if (!has_ext_fd) filtered_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    if (!has_dma_buf) filtered_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+
     local_ci.enabledExtensionCount = static_cast<uint32_t>(filtered_exts.size());
     local_ci.ppEnabledExtensionNames = filtered_exts.data();
 
-    // Filter PvrVkPhysicalDeviceMapMemoryPlacedFeaturesEXT out of pNext
-    std::vector<std::vector<uint8_t>> copied_structs;
-    const void* cur = pCreateInfo->pNext;
-    // Walk and skip VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT
-    // Note: simple single-skip or unlink on local copy if needed
-    const GenericStruct* prev_kept = nullptr;
-    (void)prev_kept;
-    if (cur && reinterpret_cast<const GenericStruct*>(cur)->sType ==
-                   VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) {
-        local_ci.pNext = reinterpret_cast<const GenericStruct*>(cur)->pNext;
-    }
+    PvrPNextArena arena;
+    local_ci.pNext = arena.filter(pCreateInfo->pNext, is_filtered_device_stype);
 
     VkResult res;
     {
@@ -488,19 +502,29 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
         return disp->GetDeviceProcAddr(*pDevice, name);
     };
     ddisp->DestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(resolve_dev("vkDestroyDevice"));
+    ddisp->DeviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(resolve_dev("vkDeviceWaitIdle"));
+    ddisp->QueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(resolve_dev("vkQueueWaitIdle"));
+    ddisp->QueueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(resolve_dev("vkQueueSubmit"));
+    ddisp->QueueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2>(resolve_dev("vkQueueSubmit2"));
     ddisp->AllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(resolve_dev("vkAllocateMemory"));
     ddisp->FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolve_dev("vkFreeMemory"));
     ddisp->MapMemory = reinterpret_cast<PFN_vkMapMemory>(resolve_dev("vkMapMemory"));
     ddisp->UnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(resolve_dev("vkUnmapMemory"));
+    ddisp->BindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(resolve_dev("vkBindBufferMemory"));
+    ddisp->BindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(resolve_dev("vkBindImageMemory"));
+    ddisp->CreateGraphicsPipelines = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(resolve_dev("vkCreateGraphicsPipelines"));
+    ddisp->CreateComputePipelines = reinterpret_cast<PFN_vkCreateComputePipelines>(resolve_dev("vkCreateComputePipelines"));
     ddisp->GetMemoryFdKHR = reinterpret_cast<PFN_vkGetMemoryFdKHR>(resolve_dev("vkGetMemoryFdKHR"));
     ddisp->GetDeviceProcAddr = disp->GetDeviceProcAddr;
     ddisp->has_external_fd = (ddisp->GetMemoryFdKHR != nullptr);
+    ddisp->has_dma_buf = (ddisp->GetMemoryFdKHR != nullptr);
 
     if (disp->GetPhysicalDeviceMemoryProperties) {
         VkPhysicalDeviceMemoryProperties mp{};
         PvrX18Guard guard;
         disp->GetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
-        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        for (uint32_t i = 0; i < mp.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            ddisp->type_to_heap[i] = mp.memoryTypes[i].heapIndex;
             if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
                 ddisp->host_visible_type_mask |= (1u << i);
             }
@@ -534,31 +558,28 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkAllocateMemory(
     if (!ddisp || !ddisp->AllocateMemory) return VK_ERROR_INITIALIZATION_FAILED;
 
     VkMemoryAllocateInfo local_ai = *pAllocateInfo;
+    PvrPNextArena arena;
+    local_ai.pNext = arena.filter(pAllocateInfo->pNext, is_filtered_alloc_stype);
+    const void* clean_tail = local_ai.pNext;
 
-    // Sanitize pNext chain: skip unsupported Wine/placed/host-pointer structs
-    while (local_ai.pNext &&
-           is_filtered_alloc_stype(reinterpret_cast<const GenericStruct*>(local_ai.pNext)->sType)) {
-        local_ai.pNext = reinterpret_cast<const GenericStruct*>(local_ai.pNext)->pNext;
-    }
-
-    // Check if an export struct is already present
     bool has_export = false;
-    const void* scan = local_ai.pNext;
-    while (scan) {
-        const auto* gs = reinterpret_cast<const GenericStruct*>(scan);
-        if (gs->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO) {
+    for (const void* scan = clean_tail; scan;
+         scan = reinterpret_cast<const PvrGenericInStruct*>(scan)->pNext) {
+        if (reinterpret_cast<const PvrGenericInStruct*>(scan)->sType ==
+            VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO) {
             has_export = true;
             break;
         }
-        scan = gs->pNext;
     }
 
     bool is_host_visible = (ddisp->host_visible_type_mask & (1u << local_ai.memoryTypeIndex)) != 0;
+    VkExternalMemoryHandleTypeFlagBits used_handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     VkExportMemoryAllocateInfo export_info{};
     bool tried_export = false;
+
     if (!has_export && is_host_visible && ddisp->has_external_fd) {
         export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-        export_info.pNext = local_ai.pNext;
+        export_info.pNext = clean_tail;
         export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
         local_ai.pNext = &export_info;
         tried_export = true;
@@ -570,9 +591,17 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkAllocateMemory(
         res = ddisp->AllocateMemory(device, &local_ai, pAllocator, pMemory);
     }
 
-    // If adding export_info caused rejection, retry cleanly without export_info
+    // Fallback to DMA_BUF_BIT_EXT if OPAQUE_FD_BIT was rejected
+    if (res != VK_SUCCESS && tried_export && ddisp->has_dma_buf) {
+        export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        used_handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        PvrX18Guard guard;
+        res = ddisp->AllocateMemory(device, &local_ai, pAllocator, pMemory);
+    }
+
+    // Final fallback without export_info
     if (res != VK_SUCCESS && tried_export) {
-        local_ai.pNext = export_info.pNext;
+        local_ai.pNext = clean_tail;
         tried_export = false;
         PvrX18Guard guard;
         res = ddisp->AllocateMemory(device, &local_ai, pAllocator, pMemory);
@@ -586,11 +615,14 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkAllocateMemory(
         MemoryRecord rec;
         rec.size = pAllocateInfo->allocationSize;
         rec.memory_type_index = pAllocateInfo->memoryTypeIndex;
+        rec.heap_index = (pAllocateInfo->memoryTypeIndex < VK_MAX_MEMORY_TYPES)
+                             ? ddisp->type_to_heap[pAllocateInfo->memoryTypeIndex]
+                             : 0;
         if (tried_export && ddisp->GetMemoryFdKHR) {
             VkMemoryGetFdInfoKHR fd_info{};
             fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
             fd_info.memory = *pMemory;
-            fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+            fd_info.handleType = used_handle_type;
             int fd = -1;
             PvrX18Guard guard;
             if (ddisp->GetMemoryFdKHR(device, &fd_info, &fd) == VK_SUCCESS) {
@@ -599,6 +631,9 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkAllocateMemory(
         }
         std::lock_guard<std::mutex> lock(g_state_mutex);
         g_memories[*pMemory] = rec;
+        if (rec.heap_index < VK_MAX_MEMORY_HEAPS) {
+            g_heap_usage[rec.heap_index] += rec.size;
+        }
     }
 
     return res;
@@ -615,6 +650,10 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkFreeMemory(
         std::lock_guard<std::mutex> lock(g_state_mutex);
         auto it = g_memories.find(memory);
         if (it != g_memories.end()) {
+            if (it->second.heap_index < VK_MAX_MEMORY_HEAPS &&
+                g_heap_usage[it->second.heap_index] >= it->second.size) {
+                g_heap_usage[it->second.heap_index] -= it->second.size;
+            }
             if (it->second.exported_fd >= 0) {
                 close(it->second.exported_fd);
             }
@@ -626,6 +665,28 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkFreeMemory(
     ddisp->FreeMemory(device, memory, pAllocator);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkMapMemory(
+    VkDevice device,
+    VkDeviceMemory memory,
+    VkDeviceSize offset,
+    VkDeviceSize size,
+    VkMemoryMapFlags flags,
+    void** ppData) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->MapMemory) return VK_ERROR_MEMORY_MAP_FAILED;
+    PvrX18Guard guard;
+    return ddisp->MapMemory(device, memory, offset, size, flags, ppData);
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkUnmapMemory(
+    VkDevice device,
+    VkDeviceMemory memory) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->UnmapMemory) return;
+    PvrX18Guard guard;
+    ddisp->UnmapMemory(device, memory);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkMapMemory2KHR(
     VkDevice device,
     const PvrVkMemoryMapInfoKHR* pMemoryMapInfo,
@@ -634,14 +695,13 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkMapMemory2KHR(
     if (!ddisp || !pMemoryMapInfo || !ppData) return VK_ERROR_INITIALIZATION_FAILED;
 
     void* placed_addr = nullptr;
-    const void* cur = pMemoryMapInfo->pNext;
-    while (cur) {
-        const auto* gs = reinterpret_cast<const GenericStruct*>(cur);
-        if (gs->sType == VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT) {
+    for (const void* cur = pMemoryMapInfo->pNext; cur;
+         cur = reinterpret_cast<const PvrGenericInStruct*>(cur)->pNext) {
+        if (reinterpret_cast<const PvrGenericInStruct*>(cur)->sType ==
+            VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT) {
             placed_addr = reinterpret_cast<const PvrVkMemoryMapPlacedInfoEXT*>(cur)->pPlacedAddress;
             break;
         }
-        cur = gs->pNext;
     }
 
     if ((pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) && placed_addr) {
@@ -718,8 +778,12 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkUnmapMemory2KHR(
     }
 
     if (!was_native && placed_addr && mapped_size > 0) {
-        // Restore anonymous reservation if requested or unmap cleanly
-        munmap(placed_addr, static_cast<size_t>(mapped_size));
+        if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+            mmap(placed_addr, static_cast<size_t>(mapped_size), PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        } else {
+            munmap(placed_addr, static_cast<size_t>(mapped_size));
+        }
         return VK_SUCCESS;
     }
 
@@ -730,18 +794,95 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkUnmapMemory2KHR(
     return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkBindBufferMemory(
+    VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->BindBufferMemory) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->BindBufferMemory(device, buffer, memory, memoryOffset);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkBindImageMemory(
+    VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->BindImageMemory) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->BindImageMemory(device, image, memory, memoryOffset);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateGraphicsPipelines(
+    VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator,
+    VkPipeline* pPipelines) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->CreateGraphicsPipelines) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->CreateGraphicsPipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateComputePipelines(
+    VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkComputePipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator,
+    VkPipeline* pPipelines) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->CreateComputePipelines) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->CreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkDeviceWaitIdle(VkDevice device) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->DeviceWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->DeviceWaitIdle(device);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkQueueWaitIdle(VkQueue queue) {
+    DeviceDispatch* ddisp = get_queue_device(queue);
+    if (!ddisp || !ddisp->QueueWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->QueueWaitIdle(queue);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkQueueSubmit(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
+    DeviceDispatch* ddisp = get_queue_device(queue);
+    if (!ddisp || !ddisp->QueueSubmit) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->QueueSubmit(queue, submitCount, pSubmits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkQueueSubmit2(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
+    DeviceDispatch* ddisp = get_queue_device(queue);
+    if (!ddisp || !ddisp->QueueSubmit2) return VK_ERROR_INITIALIZATION_FAILED;
+    PvrX18Guard guard;
+    return ddisp->QueueSubmit2(queue, submitCount, pSubmits, fence);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetDeviceProcAddr(
     VkDevice device,
     const char* pName) {
     if (!pName) return nullptr;
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetDeviceProcAddr);
     if (strcmp(pName, "vkDestroyDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkDestroyDevice);
+    if (strcmp(pName, "vkDeviceWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkDeviceWaitIdle);
+    if (strcmp(pName, "vkQueueWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkQueueWaitIdle);
+    if (strcmp(pName, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkQueueSubmit);
+    if (strcmp(pName, "vkQueueSubmit2") == 0 || strcmp(pName, "vkQueueSubmit2KHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkQueueSubmit2);
     if (strcmp(pName, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkAllocateMemory);
     if (strcmp(pName, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkFreeMemory);
+    if (strcmp(pName, "vkMapMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkMapMemory);
+    if (strcmp(pName, "vkUnmapMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkUnmapMemory);
     if (strcmp(pName, "vkMapMemory2KHR") == 0 || strcmp(pName, "vkMapMemory2") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkMapMemory2KHR);
     if (strcmp(pName, "vkUnmapMemory2KHR") == 0 || strcmp(pName, "vkUnmapMemory2") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkUnmapMemory2KHR);
+    if (strcmp(pName, "vkBindBufferMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkBindBufferMemory);
+    if (strcmp(pName, "vkBindImageMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkBindImageMemory);
+    if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateGraphicsPipelines);
+    if (strcmp(pName, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateComputePipelines);
 
     DeviceDispatch* ddisp = get_device_dispatch(device);
     if (ddisp && ddisp->GetDeviceProcAddr) {
@@ -762,6 +903,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(
     if (strcmp(pName, "vkDestroyInstance") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkDestroyInstance);
     if (strcmp(pName, "vkEnumeratePhysicalDevices") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkEnumeratePhysicalDevices);
     if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkEnumerateDeviceExtensionProperties);
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetPhysicalDeviceFeatures);
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 || strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetPhysicalDeviceFeatures2);
     if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 || strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0)
@@ -773,14 +916,25 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(
     if (strcmp(pName, "vkCreateDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateDevice);
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetDeviceProcAddr);
 
-    // Check device-level hooks via GIPA as well
-    if (PFN_vkVoidFunction dev_fn = pvr_vkGetDeviceProcAddr(VK_NULL_HANDLE, pName)) {
-        if (strcmp(pName, "vkAllocateMemory") == 0 ||
-            strcmp(pName, "vkFreeMemory") == 0 ||
-            strcmp(pName, "vkMapMemory2KHR") == 0 ||
-            strcmp(pName, "vkUnmapMemory2KHR") == 0 ||
-            strcmp(pName, "vkDestroyDevice") == 0) {
-            return dev_fn;
+    if (instance != VK_NULL_HANDLE) {
+        if (PFN_vkVoidFunction dev_fn = pvr_vkGetDeviceProcAddr(VK_NULL_HANDLE, pName)) {
+            if (strcmp(pName, "vkAllocateMemory") == 0 ||
+                strcmp(pName, "vkFreeMemory") == 0 ||
+                strcmp(pName, "vkMapMemory") == 0 ||
+                strcmp(pName, "vkUnmapMemory") == 0 ||
+                strcmp(pName, "vkMapMemory2KHR") == 0 ||
+                strcmp(pName, "vkUnmapMemory2KHR") == 0 ||
+                strcmp(pName, "vkBindBufferMemory") == 0 ||
+                strcmp(pName, "vkBindImageMemory") == 0 ||
+                strcmp(pName, "vkCreateGraphicsPipelines") == 0 ||
+                strcmp(pName, "vkCreateComputePipelines") == 0 ||
+                strcmp(pName, "vkQueueSubmit") == 0 ||
+                strcmp(pName, "vkQueueSubmit2") == 0 ||
+                strcmp(pName, "vkDeviceWaitIdle") == 0 ||
+                strcmp(pName, "vkQueueWaitIdle") == 0 ||
+                strcmp(pName, "vkDestroyDevice") == 0) {
+                return dev_fn;
+            }
         }
     }
 
