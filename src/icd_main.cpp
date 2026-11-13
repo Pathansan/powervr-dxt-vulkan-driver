@@ -4,6 +4,7 @@
 #include "x18_guard.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <stdio.h>
@@ -38,6 +39,10 @@ static uint64_t read_meminfo_available_bytes() {
     return avail_kb * 1024ULL;
 }
 
+extern "C" {
+extern pvr_hw_module_t HMI;
+}
+
 struct BackendLoader {
     void* handle = nullptr;
     bool is_hal = false;
@@ -57,6 +62,12 @@ struct BackendLoader {
         handle = dlopen("/vendor/lib64/hw/vulkan.powervr.so", RTLD_NOW | RTLD_LOCAL);
         if (handle) {
             auto* hmi = reinterpret_cast<pvr_hw_module_t*>(dlsym(handle, "HMI"));
+            if (hmi == &HMI) {
+                pvr_log("dlopen(/vendor/lib64/hw/vulkan.powervr.so) resolved to self; aborting self-recursion");
+                dlclose(handle);
+                handle = nullptr;
+                return false;
+            }
             if (hmi && hmi->methods && hmi->methods->open) {
                 pvr_hw_device_t* dev = nullptr;
                 int rc = hmi->methods->open(hmi, HWVULKAN_DEVICE_0, &dev);
@@ -68,9 +79,11 @@ struct BackendLoader {
                     enum_inst_ext = hal_dev->EnumerateInstanceExtensionProperties;
                     pvr_log("Loaded /vendor/lib64/hw/vulkan.powervr.so via HMI HAL (%s)",
                             hmi->name ? hmi->name : "PowerVR");
-                    return true;
+                    return (gipa != nullptr);
                 }
                 pvr_log("HMI open failed rc=%d", rc);
+            } else {
+                pvr_log("Vendor vulkan.powervr.so missing HMI methods");
             }
             dlclose(handle);
             handle = nullptr;
@@ -78,20 +91,7 @@ struct BackendLoader {
             pvr_log("dlopen(/vendor/lib64/hw/vulkan.powervr.so) failed: %s", dlerror());
         }
 
-        handle = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-        if (!handle) {
-            handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-        }
-        if (handle) {
-            gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(handle, "vkGetInstanceProcAddr"));
-            create_instance = reinterpret_cast<PFN_vkCreateInstance>(dlsym(handle, "vkCreateInstance"));
-            enum_inst_ext = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-                dlsym(handle, "vkEnumerateInstanceExtensionProperties"));
-            pvr_log("Loaded fallback libvulkan.so gipa=%p", reinterpret_cast<void*>(gipa));
-            return (gipa != nullptr);
-        }
-
-        pvr_log("FATAL: Failed to load any Vulkan backend: %s", dlerror());
+        pvr_log("FATAL: Failed to load /vendor/lib64/hw/vulkan.powervr.so");
         return false;
     }
 };
@@ -945,9 +945,76 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(
     return nullptr;
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL pvr_hal_enumerate_instance_extension_properties(
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties) {
+    if (!g_backend.ensure_loaded() || !g_backend.enum_inst_ext) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    PvrX18Guard guard;
+    return g_backend.enum_inst_ext(pLayerName, pPropertyCount, pProperties);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL pvr_hal_create_instance(
+    const VkInstanceCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkInstance* pInstance) {
+    return pvr_vkCreateInstance(pCreateInfo, pAllocator, pInstance);
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_hal_get_instance_proc_addr(
+    VkInstance instance,
+    const char* pName) {
+    return pvr_vkGetInstanceProcAddr(instance, pName);
+}
+
+static int pvr_hal_close(struct pvr_hw_device_t* device) {
+    delete reinterpret_cast<pvr_hwvulkan_device_t*>(device);
+    return 0;
+}
+
+static int pvr_hal_open(const struct pvr_hw_module_t* module, const char* id, struct pvr_hw_device_t** device) {
+    if (!id || strcmp(id, HWVULKAN_DEVICE_0) != 0 || !device) {
+        return -EINVAL;
+    }
+    pvr_log("pvr_hal_open(%s) called by Android Vulkan loader", id);
+    if (!g_backend.ensure_loaded()) {
+        pvr_log("pvr_hal_open failed: backend not loaded");
+        return -ENODEV;
+    }
+    auto* vkdev = new pvr_hwvulkan_device_t{};
+    vkdev->common.tag = HARDWARE_DEVICE_TAG;
+    vkdev->common.version = HWVULKAN_DEVICE_API_VERSION_0_1;
+    vkdev->common.module = const_cast<pvr_hw_module_t*>(module);
+    vkdev->common.close = pvr_hal_close;
+    vkdev->EnumerateInstanceExtensionProperties = pvr_hal_enumerate_instance_extension_properties;
+    vkdev->CreateInstance = pvr_hal_create_instance;
+    vkdev->GetInstanceProcAddr = pvr_hal_get_instance_proc_addr;
+    *device = &vkdev->common;
+    return 0;
+}
+
+static pvr_hw_module_methods_t g_hal_methods = {
+    .open = pvr_hal_open,
+};
+
 } // namespace
 
 extern "C" {
+
+__attribute__((visibility("default")))
+pvr_hw_module_t HMI = {
+    .tag = HARDWARE_MODULE_TAG,
+    .module_api_version = HWVULKAN_MODULE_API_VERSION_0_1,
+    .hal_api_version = 0,
+    .id = HWVULKAN_HARDWARE_MODULE_ID,
+    .name = "PowerVR DXT Compat Vulkan HAL",
+    .author = "Pathansan",
+    .methods = &g_hal_methods,
+    .dso = nullptr,
+    .reserved = {0},
+};
 
 __attribute__((visibility("default")))
 VKAPI_ATTR VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pSupportedVersion) {

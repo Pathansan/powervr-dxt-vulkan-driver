@@ -5,9 +5,13 @@
 #include <stdint.h>
 
 // Android Vulkan HAL (hwvulkan_module_t / hwvulkan_device_t)
-// Observed export in /vendor/lib64/hw/vulkan.powervr.so: "HMI"
+// Observed export in /vendor/lib64/hw/vulkan.powervr.so: "HMI" (size=248 on LP64)
 #define HWVULKAN_HARDWARE_MODULE_ID "vulkan"
 #define HWVULKAN_DEVICE_0 "vk0"
+#define HARDWARE_MODULE_TAG 0x48574d54U /* 'HWMT' */
+#define HARDWARE_DEVICE_TAG 0x48574454U /* 'HWDT' */
+#define HWVULKAN_MODULE_API_VERSION_0_1 0x0001U
+#define HWVULKAN_DEVICE_API_VERSION_0_1 0x00010000U
 
 struct pvr_hw_module_t;
 struct pvr_hw_device_t;
@@ -25,7 +29,11 @@ struct pvr_hw_module_t {
     const char* author;
     struct pvr_hw_module_methods_t* methods;
     void* dso;
+#ifdef __LP64__
+    uint64_t reserved[32 - 7];
+#else
     uint32_t reserved[32 - 7];
+#endif
 };
 
 struct pvr_hw_device_t {
