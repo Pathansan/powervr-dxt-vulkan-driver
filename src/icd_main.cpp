@@ -345,7 +345,7 @@ static bool is_blocked_device_extension(const char* name) {
         return true;
     }
     if ((strcmp(name, "VK_EXT_robustness2") == 0 || strcmp(name, "VK_KHR_robustness2") == 0) &&
-        !env_flag_enabled("PVR_ICD_ALLOW_ROBUSTNESS2")) {
+        env_flag_enabled("PVR_ICD_BLOCK_ROBUSTNESS2")) {
         return true;
     }
     if (strcmp(name, "VK_EXT_host_image_copy") == 0 && !env_flag_enabled("PVR_ICD_ALLOW_HOST_IMAGE_COPY")) {
@@ -354,7 +354,7 @@ static bool is_blocked_device_extension(const char* name) {
     if ((strcmp(name, "VK_KHR_maintenance5") == 0 ||
          strcmp(name, "VK_KHR_maintenance6") == 0 ||
          strcmp(name, "VK_KHR_copy_commands2") == 0) &&
-        !env_flag_enabled("PVR_ICD_ALLOW_MAINT56")) {
+        env_flag_enabled("PVR_ICD_BLOCK_MAINT56")) {
         return true;
     }
     return false;
@@ -476,7 +476,7 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             for (int i = 0; i < 4; ++i) flags[i] = VK_FALSE;
         } else if (static_cast<uint32_t>(header->sType) == 1000286000U &&
-                   !env_flag_enabled("PVR_ICD_ALLOW_ROBUSTNESS2")) {
+                   env_flag_enabled("PVR_ICD_BLOCK_ROBUSTNESS2")) {
             // VkPhysicalDeviceRobustness2FeaturesEXT: 3 VkBool32s after header
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             for (int i = 0; i < 3; ++i) flags[i] = VK_FALSE;
@@ -487,7 +487,7 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
             flags[0] = VK_FALSE;
         } else if ((static_cast<uint32_t>(header->sType) == 1000470000U ||
                     static_cast<uint32_t>(header->sType) == 1000545000U) &&
-                   !env_flag_enabled("PVR_ICD_ALLOW_MAINT56")) {
+                   env_flag_enabled("PVR_ICD_BLOCK_MAINT56")) {
             // VkPhysicalDeviceMaintenance5FeaturesKHR / Maintenance6FeaturesKHR: 1 VkBool32 after header
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             flags[0] = VK_FALSE;
