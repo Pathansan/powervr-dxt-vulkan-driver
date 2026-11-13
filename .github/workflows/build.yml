@@ -49,6 +49,9 @@ jobs:
           name: powervr-dxt-compat-driver
           path: |
             build/libvulkan.powervr_compat.so
+            build/libvulkan_powervr_wrapper.so
+            manifests/powervr_wrapper_icd.aarch64.json
+            manifests/VkLayer_powervr_compat.json
             dist/powervr-dxt-compat-driver.wcp
             dist/powervr-dxt-compat-adrenotools.zip
 
@@ -62,12 +65,18 @@ jobs:
               dist/powervr-dxt-compat-adrenotools.zip \
               dist/powervr-dxt-compat-driver.wcp \
               build/libvulkan.powervr_compat.so \
+              build/libvulkan_powervr_wrapper.so \
+              manifests/powervr_wrapper_icd.aarch64.json \
+              manifests/VkLayer_powervr_compat.json \
               --clobber
           else
             gh release create latest \
               dist/powervr-dxt-compat-adrenotools.zip \
               dist/powervr-dxt-compat-driver.wcp \
               build/libvulkan.powervr_compat.so \
+              build/libvulkan_powervr_wrapper.so \
+              manifests/powervr_wrapper_icd.aarch64.json \
+              manifests/VkLayer_powervr_compat.json \
               --title "Latest PowerVR DXT Compat Driver" \
               --notes "Automated build from main (${GITHUB_SHA::7}). Use powervr-dxt-compat-adrenotools.zip for GameNative Driver Manager."
           fi

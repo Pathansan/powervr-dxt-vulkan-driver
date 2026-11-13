@@ -1,5 +1,7 @@
 #include "pvr_icd.h"
 #include "pnext_utils.h"
+#include "pvr_bcn.h"
+#include "pvr_tbdr.h"
 #include "log.h"
 #include "x18_guard.h"
 
@@ -110,9 +112,16 @@ struct InstanceDispatch {
     PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2 = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 GetPhysicalDeviceMemoryProperties2 = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties GetPhysicalDeviceFormatProperties = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2 = nullptr;
     PFN_vkCreateDevice CreateDevice = nullptr;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
+};
+
+struct PendingStaging {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
 };
 
 struct DeviceDispatch {
@@ -124,20 +133,42 @@ struct DeviceDispatch {
     PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
     PFN_vkQueueSubmit2 QueueSubmit2 = nullptr;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers = nullptr;
+    PFN_vkFreeCommandBuffers FreeCommandBuffers = nullptr;
     PFN_vkAllocateMemory AllocateMemory = nullptr;
     PFN_vkFreeMemory FreeMemory = nullptr;
     PFN_vkMapMemory MapMemory = nullptr;
     PFN_vkUnmapMemory UnmapMemory = nullptr;
+    PFN_vkCreateBuffer CreateBuffer = nullptr;
+    PFN_vkDestroyBuffer DestroyBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = nullptr;
     PFN_vkBindBufferMemory BindBufferMemory = nullptr;
+    PFN_vkCreateImage CreateImage = nullptr;
+    PFN_vkDestroyImage DestroyImage = nullptr;
+    PFN_vkCreateImageView CreateImageView = nullptr;
     PFN_vkBindImageMemory BindImageMemory = nullptr;
     PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines = nullptr;
     PFN_vkCreateComputePipelines CreateComputePipelines = nullptr;
+    PFN_vkCmdBeginRendering CmdBeginRendering = nullptr;
+    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
+    PFN_vkCmdCopyBufferToImage2 CmdCopyBufferToImage2 = nullptr;
     PFN_vkGetMemoryFdKHR GetMemoryFdKHR = nullptr;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
     bool has_external_fd = false;
     bool has_dma_buf = false;
     uint32_t host_visible_type_mask = 0;
     uint32_t type_to_heap[VK_MAX_MEMORY_TYPES]{};
+    std::vector<PendingStaging> pending_staging;
+};
+
+struct BcnImageInfo {
+    VkFormat orig_format = VK_FORMAT_UNDEFINED;
+    VkFormat fallback_format = VK_FORMAT_UNDEFINED;
+};
+
+struct BufferBindInfo {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
 };
 
 struct MemoryRecord {
@@ -155,6 +186,9 @@ std::unordered_map<VkInstance, InstanceDispatch*> g_instances;
 std::unordered_map<VkPhysicalDevice, InstanceDispatch*> g_phys_to_inst;
 std::unordered_map<VkDevice, DeviceDispatch*> g_devices;
 std::unordered_map<VkQueue, DeviceDispatch*> g_queue_to_dev;
+std::unordered_map<VkCommandBuffer, DeviceDispatch*> g_cmd_to_dev;
+std::unordered_map<VkImage, BcnImageInfo> g_bcn_images;
+std::unordered_map<VkBuffer, BufferBindInfo> g_buffer_binds;
 std::unordered_map<VkDeviceMemory, MemoryRecord> g_memories;
 VkDeviceSize g_heap_usage[VK_MAX_MEMORY_HEAPS]{};
 
@@ -182,6 +216,14 @@ DeviceDispatch* get_queue_device(VkQueue queue) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     auto it = g_queue_to_dev.find(queue);
     if (it != g_queue_to_dev.end()) return it->second;
+    if (!g_devices.empty()) return g_devices.begin()->second;
+    return nullptr;
+}
+
+DeviceDispatch* get_cmd_device(VkCommandBuffer cmd) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    auto it = g_cmd_to_dev.find(cmd);
+    if (it != g_cmd_to_dev.end()) return it->second;
     if (!g_devices.empty()) return g_devices.begin()->second;
     return nullptr;
 }
@@ -241,6 +283,11 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateInstance(
     if (!disp->GetPhysicalDeviceMemoryProperties2) {
         disp->GetPhysicalDeviceMemoryProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(resolve("vkGetPhysicalDeviceMemoryProperties2KHR"));
     }
+    disp->GetPhysicalDeviceFormatProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(resolve("vkGetPhysicalDeviceFormatProperties"));
+    disp->GetPhysicalDeviceFormatProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(resolve("vkGetPhysicalDeviceFormatProperties2"));
+    if (!disp->GetPhysicalDeviceFormatProperties2) {
+        disp->GetPhysicalDeviceFormatProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(resolve("vkGetPhysicalDeviceFormatProperties2KHR"));
+    }
     disp->CreateDevice = reinterpret_cast<PFN_vkCreateDevice>(resolve("vkCreateDevice"));
     disp->GetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(resolve("vkGetDeviceProcAddr"));
     disp->QueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(resolve("vkQueuePresentKHR"));
@@ -291,7 +338,7 @@ static bool is_blocked_device_extension(const char* name) {
     }
     if ((strcmp(name, "VK_EXT_extended_dynamic_state3") == 0 ||
          strcmp(name, "VK_EXT_vertex_input_dynamic_state") == 0) &&
-        !env_flag_enabled("PVR_ICD_ALLOW_EDS3")) {
+        env_flag_enabled("PVR_ICD_BLOCK_EDS3")) {
         return true;
     }
     if (strcmp(name, "VK_EXT_descriptor_buffer") == 0 && !env_flag_enabled("PVR_ICD_ALLOW_DESCRIPTOR_BUFFER")) {
@@ -415,11 +462,11 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
             // VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT: 1 VkBool32 after header
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             flags[0] = VK_FALSE;
-        } else if (static_cast<uint32_t>(header->sType) == 1000455000U && !env_flag_enabled("PVR_ICD_ALLOW_EDS3")) {
+        } else if (static_cast<uint32_t>(header->sType) == 1000455000U && env_flag_enabled("PVR_ICD_BLOCK_EDS3")) {
             // VkPhysicalDeviceExtendedDynamicState3FeaturesEXT: 30 VkBool32s after header
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             for (int i = 0; i < 30; ++i) flags[i] = VK_FALSE;
-        } else if (static_cast<uint32_t>(header->sType) == 1000352000U && !env_flag_enabled("PVR_ICD_ALLOW_EDS3")) {
+        } else if (static_cast<uint32_t>(header->sType) == 1000352000U && env_flag_enabled("PVR_ICD_BLOCK_EDS3")) {
             // VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT: 1 VkBool32 after header
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             flags[0] = VK_FALSE;
@@ -579,14 +626,31 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
     ddisp->QueueWaitIdle = reinterpret_cast<PFN_vkQueueWaitIdle>(resolve_dev("vkQueueWaitIdle"));
     ddisp->QueueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(resolve_dev("vkQueueSubmit"));
     ddisp->QueueSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2>(resolve_dev("vkQueueSubmit2"));
+    ddisp->AllocateCommandBuffers = reinterpret_cast<PFN_vkAllocateCommandBuffers>(resolve_dev("vkAllocateCommandBuffers"));
+    ddisp->FreeCommandBuffers = reinterpret_cast<PFN_vkFreeCommandBuffers>(resolve_dev("vkFreeCommandBuffers"));
     ddisp->AllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(resolve_dev("vkAllocateMemory"));
     ddisp->FreeMemory = reinterpret_cast<PFN_vkFreeMemory>(resolve_dev("vkFreeMemory"));
     ddisp->MapMemory = reinterpret_cast<PFN_vkMapMemory>(resolve_dev("vkMapMemory"));
     ddisp->UnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(resolve_dev("vkUnmapMemory"));
+    ddisp->CreateBuffer = reinterpret_cast<PFN_vkCreateBuffer>(resolve_dev("vkCreateBuffer"));
+    ddisp->DestroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(resolve_dev("vkDestroyBuffer"));
+    ddisp->GetBufferMemoryRequirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(resolve_dev("vkGetBufferMemoryRequirements"));
     ddisp->BindBufferMemory = reinterpret_cast<PFN_vkBindBufferMemory>(resolve_dev("vkBindBufferMemory"));
+    ddisp->CreateImage = reinterpret_cast<PFN_vkCreateImage>(resolve_dev("vkCreateImage"));
+    ddisp->DestroyImage = reinterpret_cast<PFN_vkDestroyImage>(resolve_dev("vkDestroyImage"));
+    ddisp->CreateImageView = reinterpret_cast<PFN_vkCreateImageView>(resolve_dev("vkCreateImageView"));
     ddisp->BindImageMemory = reinterpret_cast<PFN_vkBindImageMemory>(resolve_dev("vkBindImageMemory"));
     ddisp->CreateGraphicsPipelines = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(resolve_dev("vkCreateGraphicsPipelines"));
     ddisp->CreateComputePipelines = reinterpret_cast<PFN_vkCreateComputePipelines>(resolve_dev("vkCreateComputePipelines"));
+    ddisp->CmdBeginRendering = reinterpret_cast<PFN_vkCmdBeginRendering>(resolve_dev("vkCmdBeginRendering"));
+    if (!ddisp->CmdBeginRendering) {
+        ddisp->CmdBeginRendering = reinterpret_cast<PFN_vkCmdBeginRendering>(resolve_dev("vkCmdBeginRenderingKHR"));
+    }
+    ddisp->CmdCopyBufferToImage = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(resolve_dev("vkCmdCopyBufferToImage"));
+    ddisp->CmdCopyBufferToImage2 = reinterpret_cast<PFN_vkCmdCopyBufferToImage2>(resolve_dev("vkCmdCopyBufferToImage2"));
+    if (!ddisp->CmdCopyBufferToImage2) {
+        ddisp->CmdCopyBufferToImage2 = reinterpret_cast<PFN_vkCmdCopyBufferToImage2>(resolve_dev("vkCmdCopyBufferToImage2KHR"));
+    }
     ddisp->GetMemoryFdKHR = reinterpret_cast<PFN_vkGetMemoryFdKHR>(resolve_dev("vkGetMemoryFdKHR"));
     ddisp->GetDeviceProcAddr = disp->GetDeviceProcAddr;
     ddisp->has_external_fd = (ddisp->GetMemoryFdKHR != nullptr);
@@ -609,10 +673,25 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
     return res;
 }
 
+static void flush_staging(DeviceDispatch* ddisp) {
+    if (!ddisp) return;
+    std::vector<PendingStaging> to_free;
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        to_free.swap(ddisp->pending_staging);
+    }
+    for (const auto& s : to_free) {
+        PvrX18Guard guard;
+        if (s.buffer != VK_NULL_HANDLE && ddisp->DestroyBuffer) ddisp->DestroyBuffer(ddisp->device, s.buffer, nullptr);
+        if (s.memory != VK_NULL_HANDLE && ddisp->FreeMemory) ddisp->FreeMemory(ddisp->device, s.memory, nullptr);
+    }
+}
+
 VKAPI_ATTR void VKAPI_CALL pvr_vkDestroyDevice(
     VkDevice device,
     const VkAllocationCallbacks* pAllocator) {
     DeviceDispatch* ddisp = get_device_dispatch(device);
+    flush_staging(ddisp);
     if (ddisp && ddisp->DestroyDevice) {
         PvrX18Guard guard;
         ddisp->DestroyDevice(device, pAllocator);
@@ -871,8 +950,16 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkBindBufferMemory(
     VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
     DeviceDispatch* ddisp = get_device_dispatch(device);
     if (!ddisp || !ddisp->BindBufferMemory) return VK_ERROR_INITIALIZATION_FAILED;
-    PvrX18Guard guard;
-    return ddisp->BindBufferMemory(device, buffer, memory, memoryOffset);
+    VkResult res;
+    {
+        PvrX18Guard guard;
+        res = ddisp->BindBufferMemory(device, buffer, memory, memoryOffset);
+    }
+    if (res == VK_SUCCESS) {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        g_buffer_binds[buffer] = {memory, memoryOffset};
+    }
+    return res;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkBindImageMemory(
@@ -903,11 +990,327 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateComputePipelines(
     return ddisp->CreateComputePipelines(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
 }
 
+VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFormatProperties(
+    VkPhysicalDevice physicalDevice,
+    VkFormat format,
+    VkFormatProperties* pFormatProperties) {
+    InstanceDispatch* disp = get_phys_instance(physicalDevice);
+    if (!disp || !disp->GetPhysicalDeviceFormatProperties) return;
+    VkFormat query_fmt = (pvr_is_bcn_format(format) &&
+                          (env_flag_enabled("PVR_ICD_EMULATE_BCN") || env_flag_enabled("PVR_ICD_SPOOF_BC")))
+                             ? pvr_bcn_fallback_format(format)
+                             : format;
+    PvrX18Guard guard;
+    disp->GetPhysicalDeviceFormatProperties(physicalDevice, query_fmt, pFormatProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFormatProperties2(
+    VkPhysicalDevice physicalDevice,
+    VkFormat format,
+    VkFormatProperties2* pFormatProperties) {
+    InstanceDispatch* disp = get_phys_instance(physicalDevice);
+    if (!disp || !disp->GetPhysicalDeviceFormatProperties2) return;
+    VkFormat query_fmt = (pvr_is_bcn_format(format) &&
+                          (env_flag_enabled("PVR_ICD_EMULATE_BCN") || env_flag_enabled("PVR_ICD_SPOOF_BC")))
+                             ? pvr_bcn_fallback_format(format)
+                             : format;
+    PvrX18Guard guard;
+    disp->GetPhysicalDeviceFormatProperties2(physicalDevice, query_fmt, pFormatProperties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkAllocateCommandBuffers(
+    VkDevice device,
+    const VkCommandBufferAllocateInfo* pAllocateInfo,
+    VkCommandBuffer* pCommandBuffers) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->AllocateCommandBuffers) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult res;
+    {
+        PvrX18Guard guard;
+        res = ddisp->AllocateCommandBuffers(device, pAllocateInfo, pCommandBuffers);
+    }
+    if (res == VK_SUCCESS && pAllocateInfo && pCommandBuffers) {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; ++i) {
+            g_cmd_to_dev[pCommandBuffers[i]] = ddisp;
+        }
+    }
+    return res;
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkFreeCommandBuffers(
+    VkDevice device,
+    VkCommandPool commandPool,
+    uint32_t commandBufferCount,
+    const VkCommandBuffer* pCommandBuffers) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (pCommandBuffers) {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        for (uint32_t i = 0; i < commandBufferCount; ++i) {
+            g_cmd_to_dev.erase(pCommandBuffers[i]);
+        }
+    }
+    if (ddisp && ddisp->FreeCommandBuffers) {
+        PvrX18Guard guard;
+        ddisp->FreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateImage(
+    VkDevice device,
+    const VkImageCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkImage* pImage) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->CreateImage || !pCreateInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    VkImageCreateInfo local_ci = *pCreateInfo;
+    bool is_bcn = pvr_is_bcn_format(pCreateInfo->format);
+    if (is_bcn) {
+        local_ci.format = pvr_bcn_fallback_format(pCreateInfo->format);
+        local_ci.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
+    VkResult res;
+    {
+        PvrX18Guard guard;
+        res = ddisp->CreateImage(device, &local_ci, pAllocator, pImage);
+    }
+    if (res == VK_SUCCESS && is_bcn && pImage && *pImage != VK_NULL_HANDLE) {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        g_bcn_images[*pImage] = {pCreateInfo->format, local_ci.format};
+    }
+    return res;
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkDestroyImage(
+    VkDevice device,
+    VkImage image,
+    const VkAllocationCallbacks* pAllocator) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        g_bcn_images.erase(image);
+    }
+    if (ddisp && ddisp->DestroyImage) {
+        PvrX18Guard guard;
+        ddisp->DestroyImage(device, image, pAllocator);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateImageView(
+    VkDevice device,
+    const VkImageViewCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkImageView* pView) {
+    DeviceDispatch* ddisp = get_device_dispatch(device);
+    if (!ddisp || !ddisp->CreateImageView || !pCreateInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    VkImageViewCreateInfo local_ci = *pCreateInfo;
+    if (pvr_is_bcn_format(local_ci.format)) {
+        local_ci.format = pvr_bcn_fallback_format(local_ci.format);
+    }
+    PvrX18Guard guard;
+    return ddisp->CreateImageView(device, &local_ci, pAllocator, pView);
+}
+
+static bool try_bcn_copy_upload(
+    DeviceDispatch* ddisp,
+    VkCommandBuffer commandBuffer,
+    VkBuffer srcBuffer,
+    VkImage dstImage,
+    VkImageLayout dstImageLayout,
+    uint32_t regionCount,
+    const VkBufferImageCopy* pRegions) {
+    BcnImageInfo img_info{};
+    BufferBindInfo buf_info{};
+    void* placed_addr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        auto it_img = g_bcn_images.find(dstImage);
+        if (it_img == g_bcn_images.end()) return false;
+        img_info = it_img->second;
+        auto it_buf = g_buffer_binds.find(srcBuffer);
+        if (it_buf == g_buffer_binds.end()) return false;
+        buf_info = it_buf->second;
+        auto it_mem = g_memories.find(buf_info.memory);
+        if (it_mem != g_memories.end() && it_mem->second.placed_addr && !it_mem->second.mapped_native) {
+            placed_addr = it_mem->second.placed_addr;
+        }
+    }
+    if (!ddisp->CreateBuffer || !ddisp->GetBufferMemoryRequirements || !ddisp->AllocateMemory ||
+        !ddisp->BindBufferMemory || !ddisp->MapMemory || !ddisp->UnmapMemory || !ddisp->CmdCopyBufferToImage) {
+        return false;
+    }
+
+    uint32_t px_bytes = pvr_bcn_dst_pixel_bytes(img_info.orig_format);
+    uint32_t blk_bytes = pvr_bcn_block_bytes(img_info.orig_format);
+    VkDeviceSize total_dst_bytes = 0;
+    std::vector<VkBufferImageCopy> dst_regions(regionCount);
+    for (uint32_t i = 0; i < regionCount; ++i) {
+        dst_regions[i] = pRegions[i];
+        dst_regions[i].bufferOffset = total_dst_bytes;
+        dst_regions[i].bufferRowLength = 0;
+        dst_regions[i].bufferImageHeight = 0;
+        total_dst_bytes += static_cast<VkDeviceSize>(pRegions[i].imageExtent.width) *
+                           pRegions[i].imageExtent.height *
+                           std::max<uint32_t>(1, pRegions[i].imageExtent.depth) * px_bytes;
+    }
+    if (total_dst_bytes == 0) return false;
+
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = total_dst_bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer stg_buf = VK_NULL_HANDLE;
+    {
+        PvrX18Guard guard;
+        if (ddisp->CreateBuffer(ddisp->device, &bci, nullptr, &stg_buf) != VK_SUCCESS) return false;
+    }
+    VkMemoryRequirements mr{};
+    {
+        PvrX18Guard guard;
+        ddisp->GetBufferMemoryRequirements(ddisp->device, stg_buf, &mr);
+    }
+    uint32_t mask = mr.memoryTypeBits & ddisp->host_visible_type_mask;
+    if (mask == 0) {
+        PvrX18Guard guard;
+        ddisp->DestroyBuffer(ddisp->device, stg_buf, nullptr);
+        return false;
+    }
+    uint32_t mem_type = static_cast<uint32_t>(__builtin_ctz(mask));
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = mem_type;
+
+    VkDeviceMemory stg_mem = VK_NULL_HANDLE;
+    {
+        PvrX18Guard guard;
+        if (ddisp->AllocateMemory(ddisp->device, &mai, nullptr, &stg_mem) != VK_SUCCESS) {
+            ddisp->DestroyBuffer(ddisp->device, stg_buf, nullptr);
+            return false;
+        }
+        ddisp->BindBufferMemory(ddisp->device, stg_buf, stg_mem, 0);
+    }
+
+    void* dst_ptr = nullptr;
+    void* src_ptr = placed_addr;
+    bool mapped_src = false;
+    {
+        PvrX18Guard guard;
+        if (ddisp->MapMemory(ddisp->device, stg_mem, 0, total_dst_bytes, 0, &dst_ptr) != VK_SUCCESS) {
+            ddisp->DestroyBuffer(ddisp->device, stg_buf, nullptr);
+            ddisp->FreeMemory(ddisp->device, stg_mem, nullptr);
+            return false;
+        }
+        if (!src_ptr) {
+            if (ddisp->MapMemory(ddisp->device, buf_info.memory, 0, VK_WHOLE_SIZE, 0, &src_ptr) == VK_SUCCESS) {
+                mapped_src = true;
+            }
+        }
+    }
+    if (src_ptr && dst_ptr) {
+        for (uint32_t i = 0; i < regionCount; ++i) {
+            const auto& r = pRegions[i];
+            uint32_t row_len = r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width;
+            uint32_t row_pitch_blocks = (row_len + 3) / 4;
+            const uint8_t* s = reinterpret_cast<const uint8_t*>(src_ptr) + buf_info.offset + r.bufferOffset;
+            uint8_t* d = reinterpret_cast<uint8_t*>(dst_ptr) + dst_regions[i].bufferOffset;
+            uint32_t dst_pitch = r.imageExtent.width * px_bytes;
+            uint32_t depth = std::max<uint32_t>(1, r.imageExtent.depth);
+            uint32_t img_h = r.bufferImageHeight ? r.bufferImageHeight : r.imageExtent.height;
+            size_t src_slice_bytes = static_cast<size_t>(row_pitch_blocks) * ((img_h + 3) / 4) * blk_bytes;
+            size_t dst_slice_bytes = static_cast<size_t>(dst_pitch) * r.imageExtent.height;
+            for (uint32_t z = 0; z < depth; ++z) {
+                pvr_bcn_decode_region(
+                    img_info.orig_format,
+                    s + z * src_slice_bytes,
+                    row_pitch_blocks,
+                    r.imageExtent.width,
+                    r.imageExtent.height,
+                    d + z * dst_slice_bytes,
+                    dst_pitch);
+            }
+        }
+    }
+    {
+        PvrX18Guard guard;
+        ddisp->UnmapMemory(ddisp->device, stg_mem);
+        if (mapped_src) ddisp->UnmapMemory(ddisp->device, buf_info.memory);
+        ddisp->CmdCopyBufferToImage(commandBuffer, stg_buf, dstImage, dstImageLayout, regionCount, dst_regions.data());
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        ddisp->pending_staging.push_back({stg_buf, stg_mem});
+    }
+    return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkCmdCopyBufferToImage(
+    VkCommandBuffer commandBuffer,
+    VkBuffer srcBuffer,
+    VkImage dstImage,
+    VkImageLayout dstImageLayout,
+    uint32_t regionCount,
+    const VkBufferImageCopy* pRegions) {
+    DeviceDispatch* ddisp = get_cmd_device(commandBuffer);
+    if (!ddisp || !ddisp->CmdCopyBufferToImage) return;
+    if (try_bcn_copy_upload(ddisp, commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions)) {
+        return;
+    }
+    PvrX18Guard guard;
+    ddisp->CmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkCmdCopyBufferToImage2(
+    VkCommandBuffer commandBuffer,
+    const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo) {
+    DeviceDispatch* ddisp = get_cmd_device(commandBuffer);
+    if (!ddisp) return;
+    if (pCopyBufferToImageInfo && pCopyBufferToImageInfo->regionCount > 0 && pCopyBufferToImageInfo->pRegions) {
+        bool is_bcn = false;
+        {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            is_bcn = (g_bcn_images.find(pCopyBufferToImageInfo->dstImage) != g_bcn_images.end());
+        }
+        if (is_bcn) {
+            std::vector<VkBufferImageCopy> v1(pCopyBufferToImageInfo->regionCount);
+            for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
+                const auto& r2 = pCopyBufferToImageInfo->pRegions[i];
+                v1[i] = {r2.bufferOffset, r2.bufferRowLength, r2.bufferImageHeight,
+                         r2.imageSubresource, r2.imageOffset, r2.imageExtent};
+            }
+            if (try_bcn_copy_upload(ddisp, commandBuffer, pCopyBufferToImageInfo->srcBuffer,
+                                    pCopyBufferToImageInfo->dstImage, pCopyBufferToImageInfo->dstImageLayout,
+                                    pCopyBufferToImageInfo->regionCount, v1.data())) {
+                return;
+            }
+        }
+    }
+    if (ddisp->CmdCopyBufferToImage2) {
+        PvrX18Guard guard;
+        ddisp->CmdCopyBufferToImage2(commandBuffer, pCopyBufferToImageInfo);
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL pvr_vkCmdBeginRendering(
+    VkCommandBuffer commandBuffer,
+    const VkRenderingInfo* pRenderingInfo) {
+    DeviceDispatch* ddisp = get_cmd_device(commandBuffer);
+    if (!ddisp || !ddisp->CmdBeginRendering) return;
+    pvr_tbdr_begin_rendering(ddisp->CmdBeginRendering, commandBuffer, pRenderingInfo);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkDeviceWaitIdle(VkDevice device) {
     DeviceDispatch* ddisp = get_device_dispatch(device);
     if (!ddisp || !ddisp->DeviceWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
-    PvrX18Guard guard;
-    return ddisp->DeviceWaitIdle(device);
+    VkResult res;
+    {
+        PvrX18Guard guard;
+        res = ddisp->DeviceWaitIdle(device);
+    }
+    if (res == VK_SUCCESS) flush_staging(ddisp);
+    return res;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkQueueWaitIdle(VkQueue queue) {
@@ -955,7 +1358,17 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetDeviceProcAddr(
     if (strcmp(pName, "vkBindBufferMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkBindBufferMemory);
     if (strcmp(pName, "vkBindImageMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkBindImageMemory);
     if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateGraphicsPipelines);
-    if (strcmp(pName, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateComputePipelines);
+    if (strcmp(pName, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkCreateComputePipelines>(pvr_vkCreateComputePipelines);
+    if (strcmp(pName, "vkAllocateCommandBuffers") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkAllocateCommandBuffers);
+    if (strcmp(pName, "vkFreeCommandBuffers") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkFreeCommandBuffers);
+    if (strcmp(pName, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateImage);
+    if (strcmp(pName, "vkDestroyImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkDestroyImage);
+    if (strcmp(pName, "vkCreateImageView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateImageView);
+    if (strcmp(pName, "vkCmdCopyBufferToImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCmdCopyBufferToImage);
+    if (strcmp(pName, "vkCmdCopyBufferToImage2") == 0 || strcmp(pName, "vkCmdCopyBufferToImage2KHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCmdCopyBufferToImage2);
+    if (strcmp(pName, "vkCmdBeginRendering") == 0 || strcmp(pName, "vkCmdBeginRenderingKHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCmdBeginRendering);
 
     DeviceDispatch* ddisp = get_device_dispatch(device);
     if (ddisp && ddisp->GetDeviceProcAddr) {
@@ -986,6 +1399,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(
         return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetPhysicalDeviceMemoryProperties);
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 || strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetPhysicalDeviceMemoryProperties2);
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetPhysicalDeviceFormatProperties);
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 || strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetPhysicalDeviceFormatProperties2);
     if (strcmp(pName, "vkCreateDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateDevice);
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkGetDeviceProcAddr);
 
