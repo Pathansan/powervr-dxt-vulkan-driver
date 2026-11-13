@@ -14,6 +14,7 @@
 #include <stdlib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -1063,6 +1064,14 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateImage(
     VkImage* pImage) {
     DeviceDispatch* ddisp = get_device_dispatch(device);
     if (!ddisp || !ddisp->CreateImage || !pCreateInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    static std::atomic<int> img_log_count{0};
+    int idx = img_log_count.fetch_add(1);
+    if (idx < 8) {
+        pvr_log("vkCreateImage[%d]: fmt=%d %ux%ux%u usage=0x%x",
+                idx, static_cast<int>(pCreateInfo->format),
+                pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->extent.depth,
+                pCreateInfo->usage);
+    }
     VkImageCreateInfo local_ci = *pCreateInfo;
     bool is_bcn = pvr_is_bcn_format(pCreateInfo->format);
     if (is_bcn) {
@@ -1255,6 +1264,10 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkCmdCopyBufferToImage(
     const VkBufferImageCopy* pRegions) {
     DeviceDispatch* ddisp = get_cmd_device(commandBuffer);
     if (!ddisp || !ddisp->CmdCopyBufferToImage) return;
+    static std::atomic<int> copy1_log{0};
+    if (copy1_log.fetch_add(1) < 3) {
+        pvr_log("vkCmdCopyBufferToImage called (regions=%u)", regionCount);
+    }
     if (try_bcn_copy_upload(ddisp, commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions)) {
         return;
     }
@@ -1267,6 +1280,10 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkCmdCopyBufferToImage2(
     const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo) {
     DeviceDispatch* ddisp = get_cmd_device(commandBuffer);
     if (!ddisp) return;
+    static std::atomic<int> copy2_log{0};
+    if (copy2_log.fetch_add(1) < 3) {
+        pvr_log("vkCmdCopyBufferToImage2 called");
+    }
     if (pCopyBufferToImageInfo && pCopyBufferToImageInfo->regionCount > 0 && pCopyBufferToImageInfo->pRegions) {
         bool is_bcn = false;
         {
@@ -1298,6 +1315,10 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkCmdBeginRendering(
     const VkRenderingInfo* pRenderingInfo) {
     DeviceDispatch* ddisp = get_cmd_device(commandBuffer);
     if (!ddisp || !ddisp->CmdBeginRendering) return;
+    static std::atomic<int> ren_log{0};
+    if (ren_log.fetch_add(1) < 3) {
+        pvr_log("vkCmdBeginRendering called (colorAtts=%u)", pRenderingInfo ? pRenderingInfo->colorAttachmentCount : 0);
+    }
     pvr_tbdr_begin_rendering(ddisp->CmdBeginRendering, commandBuffer, pRenderingInfo);
 }
 
