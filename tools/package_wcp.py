@@ -3,13 +3,15 @@ import io
 import json
 import os
 import tarfile
+import zipfile
 import zstandard
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Package PowerVR DXT Compat Vulkan ICD into a GameNative .wcp driver")
+    parser = argparse.ArgumentParser(description="Package PowerVR DXT Compat Vulkan ICD into .wcp and Adrenotools .zip")
     parser.add_argument("--so", required=True, help="Path to compiled libvulkan.powervr_compat.so")
     parser.add_argument("--out", required=True, help="Output .wcp path")
+    parser.add_argument("--adrenotools-zip", default="", help="Optional output Adrenotools .zip path (for GameNative)")
     parser.add_argument("--version", default="0.1.0-pvr-dxt", help="Driver versionName")
     args = parser.parse_args()
 
@@ -50,6 +52,25 @@ def main():
         f.write(compressed)
 
     print(f"Packaged {args.out} ({len(compressed)} bytes)")
+
+    if args.adrenotools_zip:
+        meta = {
+            "schemaVersion": 1,
+            "name": f"PowerVR DXT Compat {args.version}",
+            "description": "PowerVR DXT-48-1536 MC1 Translation Vulkan ICD (ARM64EC x18 guard + placed memory + memory budget)",
+            "author": "Pathansan",
+            "packageVersion": "1",
+            "vendor": "PowerVR-Compat",
+            "driverVersion": args.version,
+            "minApi": 29,
+            "libraryName": "libvulkan.powervr_compat.so",
+        }
+        meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
+        os.makedirs(os.path.dirname(os.path.abspath(args.adrenotools_zip)), exist_ok=True)
+        with zipfile.ZipFile(args.adrenotools_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("meta.json", meta_bytes)
+            zf.writestr("libvulkan.powervr_compat.so", so_bytes)
+        print(f"Packaged {args.adrenotools_zip} ({os.path.getsize(args.adrenotools_zip)} bytes)")
 
 
 if __name__ == "__main__":

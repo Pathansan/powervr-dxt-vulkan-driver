@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-arm64:
     runs-on: ubuntu-latest
@@ -31,12 +34,13 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
-      - name: Set up Python and package .wcp
+      - name: Set up Python and package .wcp + Adrenotools .zip
         run: |
           python3 -m pip install --user zstandard
           python3 tools/package_wcp.py \
             --so build/libvulkan.powervr_compat.so \
             --out dist/powervr-dxt-compat-driver.wcp \
+            --adrenotools-zip dist/powervr-dxt-compat-adrenotools.zip \
             --version "0.1.0-${GITHUB_SHA::7}"
 
       - name: Upload driver artifacts
@@ -46,3 +50,24 @@ jobs:
           path: |
             build/libvulkan.powervr_compat.so
             dist/powervr-dxt-compat-driver.wcp
+            dist/powervr-dxt-compat-adrenotools.zip
+
+      - name: Publish latest GitHub Release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest \
+              dist/powervr-dxt-compat-adrenotools.zip \
+              dist/powervr-dxt-compat-driver.wcp \
+              build/libvulkan.powervr_compat.so \
+              --clobber
+          else
+            gh release create latest \
+              dist/powervr-dxt-compat-adrenotools.zip \
+              dist/powervr-dxt-compat-driver.wcp \
+              build/libvulkan.powervr_compat.so \
+              --title "Latest PowerVR DXT Compat Driver" \
+              --notes "Automated build from main (${GITHUB_SHA::7}). Use powervr-dxt-compat-adrenotools.zip for GameNative Driver Manager."
+          fi
