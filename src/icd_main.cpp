@@ -1358,7 +1358,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetDeviceProcAddr(
     if (strcmp(pName, "vkBindBufferMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkBindBufferMemory);
     if (strcmp(pName, "vkBindImageMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkBindImageMemory);
     if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateGraphicsPipelines);
-    if (strcmp(pName, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkCreateComputePipelines>(pvr_vkCreateComputePipelines);
+    if (strcmp(pName, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateComputePipelines);
     if (strcmp(pName, "vkAllocateCommandBuffers") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkAllocateCommandBuffers);
     if (strcmp(pName, "vkFreeCommandBuffers") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkFreeCommandBuffers);
     if (strcmp(pName, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(pvr_vkCreateImage);
@@ -1418,6 +1418,16 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL pvr_vkGetInstanceProcAddr(
                 strcmp(pName, "vkBindImageMemory") == 0 ||
                 strcmp(pName, "vkCreateGraphicsPipelines") == 0 ||
                 strcmp(pName, "vkCreateComputePipelines") == 0 ||
+                strcmp(pName, "vkAllocateCommandBuffers") == 0 ||
+                strcmp(pName, "vkFreeCommandBuffers") == 0 ||
+                strcmp(pName, "vkCreateImage") == 0 ||
+                strcmp(pName, "vkDestroyImage") == 0 ||
+                strcmp(pName, "vkCreateImageView") == 0 ||
+                strcmp(pName, "vkCmdCopyBufferToImage") == 0 ||
+                strcmp(pName, "vkCmdCopyBufferToImage2") == 0 ||
+                strcmp(pName, "vkCmdCopyBufferToImage2KHR") == 0 ||
+                strcmp(pName, "vkCmdBeginRendering") == 0 ||
+                strcmp(pName, "vkCmdBeginRenderingKHR") == 0 ||
                 strcmp(pName, "vkQueueSubmit") == 0 ||
                 strcmp(pName, "vkQueueSubmit2") == 0 ||
                 strcmp(pName, "vkDeviceWaitIdle") == 0 ||
