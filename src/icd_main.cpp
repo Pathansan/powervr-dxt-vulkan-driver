@@ -297,6 +297,19 @@ static bool is_blocked_device_extension(const char* name) {
     if (strcmp(name, "VK_EXT_descriptor_buffer") == 0 && !env_flag_enabled("PVR_ICD_ALLOW_DESCRIPTOR_BUFFER")) {
         return true;
     }
+    if ((strcmp(name, "VK_EXT_robustness2") == 0 || strcmp(name, "VK_KHR_robustness2") == 0) &&
+        !env_flag_enabled("PVR_ICD_ALLOW_ROBUSTNESS2")) {
+        return true;
+    }
+    if (strcmp(name, "VK_EXT_host_image_copy") == 0 && !env_flag_enabled("PVR_ICD_ALLOW_HOST_IMAGE_COPY")) {
+        return true;
+    }
+    if ((strcmp(name, "VK_KHR_maintenance5") == 0 ||
+         strcmp(name, "VK_KHR_maintenance6") == 0 ||
+         strcmp(name, "VK_KHR_copy_commands2") == 0) &&
+        !env_flag_enabled("PVR_ICD_ALLOW_MAINT56")) {
+        return true;
+    }
     return false;
 }
 
@@ -415,6 +428,22 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
             // VkPhysicalDeviceDescriptorBufferFeaturesEXT: 4 VkBool32s after header
             auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
             for (int i = 0; i < 4; ++i) flags[i] = VK_FALSE;
+        } else if (static_cast<uint32_t>(header->sType) == 1000286000U &&
+                   !env_flag_enabled("PVR_ICD_ALLOW_ROBUSTNESS2")) {
+            // VkPhysicalDeviceRobustness2FeaturesEXT: 3 VkBool32s after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            for (int i = 0; i < 3; ++i) flags[i] = VK_FALSE;
+        } else if (static_cast<uint32_t>(header->sType) == 1000270000U &&
+                   !env_flag_enabled("PVR_ICD_ALLOW_HOST_IMAGE_COPY")) {
+            // VkPhysicalDeviceHostImageCopyFeaturesEXT: 1 VkBool32 after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            flags[0] = VK_FALSE;
+        } else if ((static_cast<uint32_t>(header->sType) == 1000470000U ||
+                    static_cast<uint32_t>(header->sType) == 1000545000U) &&
+                   !env_flag_enabled("PVR_ICD_ALLOW_MAINT56")) {
+            // VkPhysicalDeviceMaintenance5FeaturesKHR / Maintenance6FeaturesKHR: 1 VkBool32 after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            flags[0] = VK_FALSE;
         }
         next = header->pNext;
     }
@@ -502,16 +531,21 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkCreateDevice(
     bool has_ext_fd = false;
     bool has_dma_buf = false;
 
+    std::string ext_list;
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
+        if (!ext_list.empty()) ext_list += ',';
+        ext_list += ext;
         if (strcmp(ext, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) == 0 ||
-            strcmp(ext, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+            strcmp(ext, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0 ||
+            is_blocked_device_extension(ext)) {
             continue;
         }
         if (strcmp(ext, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) has_ext_fd = true;
         if (strcmp(ext, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) has_dma_buf = true;
         filtered_exts.push_back(ext);
     }
+    pvr_log("vkCreateDevice requested exts (%u): %s", pCreateInfo->enabledExtensionCount, ext_list.c_str());
     if (!has_ext_fd) filtered_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     if (!has_dma_buf) filtered_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
 
