@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -283,6 +284,22 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumeratePhysicalDevices(
     return res;
 }
 
+static bool is_blocked_device_extension(const char* name) {
+    if (!name) return false;
+    if (strcmp(name, "VK_EXT_graphics_pipeline_library") == 0 && !env_flag_enabled("PVR_ICD_ALLOW_GPL")) {
+        return true;
+    }
+    if ((strcmp(name, "VK_EXT_extended_dynamic_state3") == 0 ||
+         strcmp(name, "VK_EXT_vertex_input_dynamic_state") == 0) &&
+        !env_flag_enabled("PVR_ICD_ALLOW_EDS3")) {
+        return true;
+    }
+    if (strcmp(name, "VK_EXT_descriptor_buffer") == 0 && !env_flag_enabled("PVR_ICD_ALLOW_DESCRIPTOR_BUFFER")) {
+        return true;
+    }
+    return false;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumerateDeviceExtensionProperties(
     VkPhysicalDevice physicalDevice,
     const char* pLayerName,
@@ -307,6 +324,11 @@ VKAPI_ATTR VkResult VKAPI_CALL pvr_vkEnumerateDeviceExtensionProperties(
     }
 
     if (!pLayerName) {
+        exts.erase(
+            std::remove_if(exts.begin(), exts.end(),
+                           [](const VkExtensionProperties& e) { return is_blocked_device_extension(e.extensionName); }),
+            exts.end());
+
         auto add_if_missing = [&](const char* name, uint32_t spec_ver) {
             for (const auto& e : exts) {
                 if (strcmp(e.extensionName, name) == 0) return;
@@ -376,6 +398,23 @@ VKAPI_ATTR void VKAPI_CALL pvr_vkGetPhysicalDeviceFeatures2(
             placed->memoryMapPlaced = VK_TRUE;
             placed->memoryMapRangePlaced = VK_TRUE;
             placed->memoryUnmapReserve = VK_TRUE;
+        } else if (static_cast<uint32_t>(header->sType) == 1000320000U && !env_flag_enabled("PVR_ICD_ALLOW_GPL")) {
+            // VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT: 1 VkBool32 after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            flags[0] = VK_FALSE;
+        } else if (static_cast<uint32_t>(header->sType) == 1000455000U && !env_flag_enabled("PVR_ICD_ALLOW_EDS3")) {
+            // VkPhysicalDeviceExtendedDynamicState3FeaturesEXT: 30 VkBool32s after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            for (int i = 0; i < 30; ++i) flags[i] = VK_FALSE;
+        } else if (static_cast<uint32_t>(header->sType) == 1000352000U && !env_flag_enabled("PVR_ICD_ALLOW_EDS3")) {
+            // VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT: 1 VkBool32 after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            flags[0] = VK_FALSE;
+        } else if (static_cast<uint32_t>(header->sType) == 1000316000U &&
+                   !env_flag_enabled("PVR_ICD_ALLOW_DESCRIPTOR_BUFFER")) {
+            // VkPhysicalDeviceDescriptorBufferFeaturesEXT: 4 VkBool32s after header
+            auto* flags = reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(next) + sizeof(PvrGenericOutStruct));
+            for (int i = 0; i < 4; ++i) flags[i] = VK_FALSE;
         }
         next = header->pNext;
     }
