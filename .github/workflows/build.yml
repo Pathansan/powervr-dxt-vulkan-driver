@@ -50,6 +50,7 @@ jobs:
           path: |
             build/libvulkan.powervr_compat.so
             build/libvulkan_powervr_wrapper.so
+            build/pvr_icd_test
             manifests/powervr_wrapper_icd.aarch64.json
             manifests/VkLayer_powervr_compat.json
             dist/powervr-dxt-compat-driver.wcp
@@ -66,6 +67,7 @@ jobs:
               dist/powervr-dxt-compat-driver.wcp \
               build/libvulkan.powervr_compat.so \
               build/libvulkan_powervr_wrapper.so \
+              build/pvr_icd_test \
               manifests/powervr_wrapper_icd.aarch64.json \
               manifests/VkLayer_powervr_compat.json \
               --clobber
@@ -75,6 +77,7 @@ jobs:
               dist/powervr-dxt-compat-driver.wcp \
               build/libvulkan.powervr_compat.so \
               build/libvulkan_powervr_wrapper.so \
+              build/pvr_icd_test \
               manifests/powervr_wrapper_icd.aarch64.json \
               manifests/VkLayer_powervr_compat.json \
               --title "Latest PowerVR DXT Compat Driver" \

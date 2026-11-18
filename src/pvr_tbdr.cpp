@@ -28,8 +28,9 @@ void pvr_tbdr_begin_rendering(
         info.pStencilAttachment = nullptr;
     }
 
-    // Also sanitize color attachments if any trailing ones are null (or keep indices intact with DONT_CARE).
-    std::vector<VkRenderingAttachmentInfo> color_atts;
+    // Also sanitize color attachments if any are null, using stack storage on the hot path.
+    VkRenderingAttachmentInfo stack_atts[8];
+    std::vector<VkRenderingAttachmentInfo> heap_atts;
     if (info.colorAttachmentCount > 0 && info.pColorAttachments) {
         bool has_null = false;
         for (uint32_t i = 0; i < info.colorAttachmentCount; ++i) {
@@ -39,16 +40,21 @@ void pvr_tbdr_begin_rendering(
             }
         }
         if (has_null) {
-            color_atts.assign(info.pColorAttachments, info.pColorAttachments + info.colorAttachmentCount);
-            for (auto& att : color_atts) {
-                if (att.imageView == VK_NULL_HANDLE) {
-                    att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-                    att.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                    att.resolveMode = VK_RESOLVE_MODE_NONE;
-                    att.resolveImageView = VK_NULL_HANDLE;
+            VkRenderingAttachmentInfo* dst = stack_atts;
+            if (info.colorAttachmentCount > 8) {
+                heap_atts.resize(info.colorAttachmentCount);
+                dst = heap_atts.data();
+            }
+            for (uint32_t i = 0; i < info.colorAttachmentCount; ++i) {
+                dst[i] = info.pColorAttachments[i];
+                if (dst[i].imageView == VK_NULL_HANDLE) {
+                    dst[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    dst[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                    dst[i].resolveMode = VK_RESOLVE_MODE_NONE;
+                    dst[i].resolveImageView = VK_NULL_HANDLE;
                 }
             }
-            info.pColorAttachments = color_atts.data();
+            info.pColorAttachments = dst;
         }
     }
 

@@ -54,3 +54,15 @@ set_target_properties(vulkan_powervr_wrapper PROPERTIES
     OUTPUT_NAME "vulkan_powervr_wrapper"
     LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/wrapper.map"
 )
+
+add_executable(pvr_icd_test
+    tests/pvr_icd_test.cpp
+)
+
+target_include_directories(pvr_icd_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(pvr_icd_test PRIVATE
+    dl
+)
