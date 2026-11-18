@@ -143,8 +143,10 @@ int main(int argc, char** argv) {
     auto pDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(pGetDeviceProcAddr(dev, "vkDestroyDevice"));
     auto pAllocMem = reinterpret_cast<PFN_vkAllocateMemory>(pGetDeviceProcAddr(dev, "vkAllocateMemory"));
     auto pFreeMem = reinterpret_cast<PFN_vkFreeMemory>(pGetDeviceProcAddr(dev, "vkFreeMemory"));
-    auto pMap2 = reinterpret_cast<PFN_vkMapMemory2KHR>(pGetDeviceProcAddr(dev, "vkMapMemory2KHR"));
-    auto pUnmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(pGetDeviceProcAddr(dev, "vkUnmapMemory2KHR"));
+    using PfnMap2 = VkResult(VKAPI_PTR*)(VkDevice, const PvrVkMemoryMapInfoKHR*, void**);
+    using PfnUnmap2 = VkResult(VKAPI_PTR*)(VkDevice, const PvrVkMemoryUnmapInfoKHR*);
+    auto pMap2 = reinterpret_cast<PfnMap2>(pGetDeviceProcAddr(dev, "vkMapMemory2KHR"));
+    auto pUnmap2 = reinterpret_cast<PfnUnmap2>(pGetDeviceProcAddr(dev, "vkUnmapMemory2KHR"));
 
     // Test placed memory map + unmap reserve
     uint32_t host_type = 0;
